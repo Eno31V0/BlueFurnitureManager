@@ -18,6 +18,6 @@ const INIT_FURNITURE = [
 const getSeries = (name) => SERIES_MAP[name] || "";
 const SERIES_ORDER=["その他","ノーマル家具","モモフレンズのカフェ","ゼリーズゲーセン","バレンタイン","サマーリゾート","ハロウィーンカフェ","伝統的な温泉郷","お正月","ミリタリーアウトドア","ビーチサイド","大運動会","アビドス教室","ゲーム開発部","サンシャインリゾート","デパート","ゲヘナパーティー","トリニティ教室","DJパーティー会場","百鬼夜行","ミレニアムタワーラウンジ","ハイランダー列車","ティーパーティー","ワイルドハントキャンパス","輸送船"];
 const seriesIdx = (name) => { const s=getSeries(name)||"その他"; const i=SERIES_ORDER.indexOf(s); return i>=0?i:0; };
-const FURN_TYPES = [...new Set(INIT_FURNITURE.map(f=>f.type))].sort((a,b)=>a.localeCompare(b,"ja"));
+const FURN_TYPES = ["テーブル","クローゼット","椅子","ベッド","小物","家電","壁の装飾"];
 const STUDENT_MAP = Object.fromEntries(INIT_STUDENTS.map(s => [s.id, s]));
 const FURN_MAP = Object.fromEntries(INIT_FURNITURE.map(f => [f.id, f]));
