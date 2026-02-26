@@ -15,8 +15,737 @@
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="master-data.js"></script>
-  <script type="text/babel" data-type="module">
-    import App from "./src/app.jsx";
+  <script type="text/babel">
+    const { createContext, useContext, useReducer, useState, useEffect, useMemo, useCallback, useRef } = React;
+
+    // ========== カラーパレット ==========
+    const C = {
+      bg:"#1a1b2e", card:"#252742", accent:"#4fc3f7", accentDim:"#2a6f8a",
+      gold:"#ffd54f", text:"#e8eaf6", textDim:"#9e9eaf", border:"#3a3c5a",
+      owned:"#2e7d32", room1:"#e65100", room2:"#6a1b9a", roomBoth:"#1565c0",
+      danger:"#ef5350", catFurn:"#4a6741", catDeco:"#6a4176",
+      amber:"#ffb74d", purple:"#ce93d8", hlNA:"#4fc3f7",
+    };
+    const isInRoom = (r, t) => r === 3 || r === t;
+    const roomColor = (r) => r===3?C.roomBoth:r===2?C.room2:r===1?C.room1:C.border;
+    const roomLabel = (r) => r===3?"R1&R2":r===2?"R2":r===1?"R1":"未設置";
+    const btn = (on, color) => ({
+      padding:"5px 10px", border:"none", borderRadius:6, cursor:"pointer",
+      fontSize:11, fontWeight:600,
+      background: on ? (color || C.accent) : C.card,
+      color: on ? "#000" : C.textDim,
+      transition:"all .2s", whiteSpace:"nowrap",
+    });
+
+    // ========== Storage ==========
+    const SK = "ba-mgr-v5";
+    const initState = (prev) => ({
+      version: 5,
+      students: Object.fromEntries(INIT_STUDENTS.map(s => {
+        const p = prev?.students?.[s.id];
+        return [s.id, { owned: p?.owned ?? false, star: p?.star ?? s.star, bond: p?.bond ?? 1, hasEx: p?.hasEx ?? s.hasEx }];
+      })),
+      furniture: Object.fromEntries(INIT_FURNITURE.map(f => {
+        const p = prev?.furniture?.[f.id];
+        return [f.id, { owned: p?.owned ?? false, room: p?.room ?? 0 }];
+      })),
+      furnitureOrder: prev?.furnitureOrder || INIT_FURNITURE.map(f => f.id),
+      customStudents:  prev?.customStudents  || [],
+      customFurniture: prev?.customFurniture || [],
+      masterEdits: prev?.masterEdits || { furniture: {}, students: {}, series: {} },
+    });
+
+    // ========== 検索 ==========
+    const toHiragana = (str) =>
+      str.replace(/[\u30A1-\u30F6]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0x60));
+    const searchMatch = (text, query) => {
+      const t = toHiragana(text.toLowerCase());
+      const q = toHiragana(query.toLowerCase());
+      return t.includes(q);
+    };
+
+    // ========== Reducer ==========
+    function appReducer(state, action) {
+      switch (action.type) {
+        case "TOGGLE_FURNITURE_OWNED": {
+          const prev = state.furniture[action.fid] || { owned: false, room: 0 };
+          return { ...state, furniture: { ...state.furniture, [action.fid]: { ...prev, owned: !prev.owned } } };
+        }
+        case "SET_FURNITURE_ROOM": {
+          const prev = state.furniture[action.fid] || { owned: false, room: 0 };
+          return { ...state, furniture: { ...state.furniture, [action.fid]: { ...prev, room: action.room } } };
+        }
+        case "TOGGLE_ROOM": {
+          const prev = state.furniture[action.fid] || { owned: false, room: 0 };
+          const r = prev.room; const tr = action.targetRoom;
+          const newRoom = r === 3 ? (tr === 1 ? 2 : 1) : r === tr ? 0 : r === 0 ? tr : 3;
+          return { ...state, furniture: { ...state.furniture, [action.fid]: { ...prev, room: newRoom } } };
+        }
+        case "TOGGLE_STUDENT_OWNED": {
+          const prev = state.students[action.sid] || { owned: false, star: 3, bond: 1, hasEx: false };
+          return { ...state, students: { ...state.students, [action.sid]: { ...prev, owned: !prev.owned } } };
+        }
+        case "SET_STUDENT_STAR": {
+          const prev = state.students[action.sid] || { owned: false, star: 3, bond: 1, hasEx: false };
+          return { ...state, students: { ...state.students, [action.sid]: { ...prev, star: action.star, bond: Math.min(prev.bond, getBondCap(action.star)) } } };
+        }
+        case "SET_STUDENT_BOND": {
+          const prev = state.students[action.sid] || { owned: false, star: 3, bond: 1, hasEx: false };
+          const bond = Math.max(1, Math.min(action.bond, getBondCap(prev.star)));
+          return { ...state, students: { ...state.students, [action.sid]: { ...prev, bond } } };
+        }
+        case "TOGGLE_STUDENT_EX": {
+          const prev = state.students[action.sid] || { owned: false, star: 3, bond: 1, hasEx: false };
+          return { ...state, students: { ...state.students, [action.sid]: { ...prev, hasEx: !prev.hasEx } } };
+        }
+        case "REORDER_FURNITURE": {
+          const order = [...(state.furnitureOrder || [])];
+          const fi = order.indexOf(action.fromId); const ti = order.indexOf(action.toId);
+          if (fi < 0 || ti < 0) return state;
+          order.splice(fi, 1); order.splice(ti, 0, action.fromId);
+          return { ...state, furnitureOrder: order };
+        }
+        case "ADD_CUSTOM_STUDENT": {
+          const { student, initialState: is } = action;
+          return { ...state, customStudents: [...(state.customStudents || []), student], students: { ...state.students, [student.id]: is } };
+        }
+        case "ADD_CUSTOM_FURNITURE": {
+          const { furniture, initialState: is } = action;
+          return { ...state, customFurniture: [...(state.customFurniture || []), furniture], furniture: { ...state.furniture, [furniture.id]: is }, furnitureOrder: [...(state.furnitureOrder || []), furniture.id] };
+        }
+        case "DELETE_CUSTOM_STUDENT":
+          return { ...state, customStudents: (state.customStudents || []).filter(s => s.id !== action.id) };
+        case "DELETE_CUSTOM_FURNITURE":
+          return { ...state, customFurniture: (state.customFurniture || []).filter(f => f.id !== action.id), furnitureOrder: (state.furnitureOrder || []).filter(fid => fid !== action.id) };
+        case "APPLY_MASTER_EDIT_FURN": {
+          const { fid, name, targets, series } = action;
+          const me = state.masterEdits || { furniture: {}, students: {}, series: {} };
+          return { ...state, masterEdits: { ...me, furniture: { ...me.furniture, [fid]: { name, targets } }, series: { ...me.series, [name]: series } } };
+        }
+        case "APPLY_MASTER_EDIT_STUDENT": {
+          const { sid, name } = action;
+          const me = state.masterEdits || { furniture: {}, students: {}, series: {} };
+          return { ...state, masterEdits: { ...me, students: { ...me.students, [sid]: { name } } } };
+        }
+        case "IMPORT_STATE": return initState(action.data);
+        case "RESET_STATE":  return initState();
+        default: return state;
+      }
+    }
+
+    // ========== Context ==========
+    const AppContext = createContext(null);
+
+    function AppProvider({ children }) {
+      const [state, dispatch] = useReducer(appReducer, undefined, () => initState());
+      const [loaded, setLoaded] = useState(false);
+      const [hlScope, setHlScope] = useState("all");
+      const [hlThreshold, setHlThreshold] = useState("cap");
+      const [editMode, setEditMode] = useState(false);
+      const [stateBackup, setStateBackup] = useState(null);
+      const [editFurnId, setEditFurnId] = useState(null);
+      const [editStudentId, setEditStudentId] = useState(null);
+      const [editDraft, setEditDraft] = useState({});
+
+      useEffect(() => {
+        try { const raw = localStorage.getItem(SK); if (raw) dispatch({ type: "IMPORT_STATE", data: JSON.parse(raw) }); } catch {}
+        setLoaded(true);
+      }, []);
+
+      useEffect(() => {
+        if (!loaded || editMode) return;
+        try { localStorage.setItem(SK, JSON.stringify(state)); } catch {}
+      }, [state, loaded, editMode]);
+
+      const enterEdit = useCallback(() => {
+        setStateBackup(JSON.parse(JSON.stringify(state)));
+        setEditMode(true); setEditFurnId(null); setEditStudentId(null);
+      }, [state]);
+      const saveEdit = useCallback(() => {
+        setEditMode(false); setStateBackup(null); setEditFurnId(null); setEditStudentId(null);
+        try { localStorage.setItem(SK, JSON.stringify(state)); } catch {}
+      }, [state]);
+      const cancelEdit = useCallback(() => {
+        if (stateBackup) dispatch({ type: "IMPORT_STATE", data: stateBackup });
+        setEditMode(false); setStateBackup(null); setEditFurnId(null); setEditStudentId(null);
+      }, [stateBackup]);
+
+      const allStudents = useMemo(() => [...INIT_STUDENTS, ...(state.customStudents || [])], [state.customStudents]);
+      const allFurniture = useMemo(() => [...INIT_FURNITURE, ...(state.customFurniture || [])], [state.customFurniture]);
+      const allStudentMap = useMemo(() => Object.fromEntries(allStudents.map(s => [s.id, s])), [allStudents]);
+      const allFurnMap = useMemo(() => Object.fromEntries(allFurniture.map(f => [f.id, f])), [allFurniture]);
+
+      const me = state.masterEdits || { furniture: {}, students: {}, series: {} };
+      const eFurnName    = useCallback((f) => me.furniture?.[f.id]?.name || f.name, [me.furniture]);
+      const eFurnTargets = useCallback((f) => me.furniture?.[f.id]?.targets || f.targets, [me.furniture]);
+      const eFurnSeries  = useCallback((f) => { const n = eFurnName(f); return me.series?.[n] ?? (SERIES_MAP[n] || SERIES_MAP[f.name] || ""); }, [eFurnName, me.series]);
+      const eStudentName = useCallback((s) => me.students?.[s.id]?.name || s.name, [me.students]);
+      const gss = useCallback((sid) => state.students[sid] || { owned: false, star: STUDENT_MAP[sid]?.star || 3, bond: 1, hasEx: STUDENT_MAP[sid]?.hasEx || false }, [state.students]);
+      const gfs = useCallback((fid) => state.furniture[fid] || { owned: false, room: 0 }, [state.furniture]);
+
+      const motionStudentIds = useMemo(() => {
+        const s = new Set(); allFurniture.forEach(f => eFurnTargets(f).forEach(sid => s.add(sid))); return s;
+      }, [allFurniture, eFurnTargets]);
+
+      const bondCheck = useCallback((sid) => {
+        const s = gss(sid); if (!s.owned) return false;
+        if (hlThreshold === "cap") return s.bond >= getBondCap(s.star);
+        return s.hasEx ? s.bond >= 20 : s.bond >= 9;
+      }, [gss, hlThreshold]);
+
+      const furnIsAchieved = useCallback((f) => {
+        const targets = eFurnTargets(f); if (targets.length === 0) return false;
+        const ot = targets.filter(sid => gss(sid).owned); if (ot.length === 0) return false;
+        return hlScope === "all" ? ot.every(bondCheck) : ot.some(bondCheck);
+      }, [eFurnTargets, gss, hlScope, bondCheck]);
+
+      const furnHasOwnedNotAchieved = useCallback((f) => {
+        const targets = eFurnTargets(f); if (targets.length === 0) return false;
+        const ot = targets.filter(sid => gss(sid).owned); if (ot.length === 0) return false;
+        return !furnIsAchieved(f);
+      }, [eFurnTargets, gss, furnIsAchieved]);
+
+      const stats = useMemo(() => {
+        const of = allFurniture.filter(f => gfs(f.id).owned).length;
+        const r1 = allFurniture.filter(f => { const r = gfs(f.id).room; return r === 1 || r === 3; }).length;
+        const r2 = allFurniture.filter(f => { const r = gfs(f.id).room; return r === 2 || r === 3; }).length;
+        return { of, r1, r2, tf: allFurniture.length };
+      }, [state.furniture, allFurniture]);
+
+      const value = {
+        state, dispatch, loaded,
+        hlScope, setHlScope, hlThreshold, setHlThreshold,
+        editMode, enterEdit, saveEdit, cancelEdit,
+        editFurnId, setEditFurnId, editStudentId, setEditStudentId, editDraft, setEditDraft,
+        allStudents, allFurniture, allStudentMap, allFurnMap,
+        me, eFurnName, eFurnTargets, eFurnSeries, eStudentName,
+        gss, gfs, motionStudentIds, bondCheck, furnIsAchieved, furnHasOwnedNotAchieved, stats,
+      };
+      return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
+    }
+
+    const useAppContext = () => {
+      const ctx = useContext(AppContext);
+      if (!ctx) throw new Error("useAppContext must be used within AppProvider");
+      return ctx;
+    };
+
+    // ========== 家具編集フォーム ==========
+    function FurnEditForm({ title, draft, onDraftChange, onApply, onClose }) {
+      const d = draft || {};
+      const inputStyle = { flex: 1, padding: "3px 6px", borderRadius: 4, border: `1px solid ${C.border}`, background: C.bg, color: C.text, fontSize: 11, outline: "none" };
+      const labelStyle = { fontSize: 10, color: C.textDim, width: 40 };
+      const rowStyle = { display: "flex", gap: 4, alignItems: "center" };
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+          {title && <div style={{ fontSize: 10, fontWeight: 600, color: "#ffb74d", marginBottom: 2 }}>{title}</div>}
+          <div style={rowStyle}><span style={labelStyle}>名前</span><input value={d.name || ""} onChange={e => onDraftChange({ ...d, name: e.target.value })} style={inputStyle} /></div>
+          <div style={rowStyle}><span style={labelStyle}>シリーズ</span><input value={d.series || ""} onChange={e => onDraftChange({ ...d, series: e.target.value })} placeholder="(なし)" style={inputStyle} /></div>
+          <div style={rowStyle}><span style={labelStyle}>対象</span><input value={d.targets || ""} onChange={e => onDraftChange({ ...d, targets: e.target.value })} placeholder="生徒名(カンマ区切り)" style={inputStyle} /></div>
+          <div style={{ display: "flex", gap: 3, justifyContent: "flex-end" }}>
+            <button onClick={onApply} style={{ padding: "3px 10px", border: "none", borderRadius: 4, background: "#66bb6a", color: "#000", fontSize: 10, fontWeight: 700, cursor: "pointer" }}>適用</button>
+            <button onClick={onClose} style={{ padding: "3px 10px", border: "none", borderRadius: 4, background: C.card, color: C.textDim, fontSize: 10, cursor: "pointer" }}>閉じる</button>
+          </div>
+        </div>
+      );
+    }
+
+    // ========== ルームカード ==========
+    function FurnRoomCard({ f, border, showCheckbox, showSelect, roomNum, roomHlAchieved, roomHlNotAchieved }) {
+      const { dispatch, gss, gfs, eFurnName, eFurnTargets, eStudentName, allStudentMap, bondCheck, furnIsAchieved } = useAppContext();
+      const fs = gfs(f.id);
+      const isAch = furnIsAchieved(f);
+      const hasOwned = eFurnTargets(f).some(sid => gss(sid).owned);
+      const isNotAch = hasOwned && !isAch;
+      const showGold = roomHlAchieved && isAch;
+      const showBlue = roomHlNotAchieved && isNotAch;
+      const hlBg = showGold ? `${C.gold}22` : showBlue ? `${C.hlNA}18` : (showCheckbox && isInRoom(fs.room, roomNum) ? `${roomColor(roomNum)}15` : C.card);
+      const hlBorder = showGold ? C.gold : showBlue ? C.hlNA : border;
+
+      const studentNodes = eFurnTargets(f).map((sid, i) => {
+        const ss = gss(sid); const sd = allStudentMap[sid]; const name = sd ? eStudentName(sd) : "?";
+        const met = bondCheck(sid); const isOwned = ss.owned;
+        const color = met ? C.gold : (showBlue && isOwned) ? C.hlNA : C.textDim;
+        const fw = (met || (showBlue && isOwned)) ? 600 : 400;
+        return <span key={sid}>{i > 0 && <span style={{ color: C.textDim }}>, </span>}<span style={{ color, fontWeight: fw }}>{name}(★{ss.star} 絆{ss.bond})</span></span>;
+      });
+
+      const nameNode = <div style={{ fontSize: showCheckbox ? 11 : 12, fontWeight: 600 }}>
+        {eFurnName(f)}{fs.room === 3 && <span style={{ fontSize: 9, background: C.roomBoth, color: "#fff", padding: "1px 4px", borderRadius: 3, marginLeft: 4 }}>両方</span>}
+      </div>;
+      const targetNode = <div style={{ fontSize: 10, display: "flex", flexWrap: "wrap", gap: 1 }}>{studentNodes}</div>;
+      const cardStyle = { background: hlBg, borderRadius: 8, padding: showCheckbox ? "5px 10px" : "6px 10px", marginBottom: showCheckbox ? 2 : 3, border: `${showCheckbox ? 1 : 2}px solid ${hlBorder}`, boxShadow: showGold ? `0 0 8px ${C.gold}44` : showBlue ? `0 0 8px ${C.hlNA}33` : "none" };
+
+      if (showCheckbox) {
+        const checked = isInRoom(fs.room, roomNum);
+        return <div style={cardStyle}>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+            <input type="checkbox" checked={checked} onChange={() => dispatch({ type: "TOGGLE_ROOM", fid: f.id, targetRoom: roomNum })} style={{ accentColor: roomColor(roomNum), width: 15, height: 15 }} />
+            <div style={{ flex: 1, minWidth: 0 }}>{nameNode}{targetNode}</div>
+          </label>
+        </div>;
+      }
+      return <div style={cardStyle}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div style={{ flex: 1, minWidth: 0 }}>{nameNode}{targetNode}</div>
+          {showSelect && <select value={fs.room} onChange={e => dispatch({ type: "SET_FURNITURE_ROOM", fid: f.id, room: Number(e.target.value) })} style={{ background: C.card, color: C.text, border: `1px solid ${C.border}`, borderRadius: 4, padding: "3px 5px", fontSize: 11, marginLeft: 6 }}>
+            <option value={0}>未設置</option><option value={1}>ルーム1</option><option value={2}>ルーム2</option><option value={3}>両方(1&2)</option>
+          </select>}
+        </div>
+      </div>;
+    }
+
+    // ========== Tab 0: 所持状況 ==========
+    function PossessionTab({ search }) {
+      const { state, dispatch, editMode, enterEdit, saveEdit, cancelEdit, editFurnId, setEditFurnId, editStudentId, setEditStudentId, editDraft, setEditDraft, allStudents, allFurniture, allFurnMap, allStudentMap, eFurnName, eFurnTargets, eFurnSeries, eStudentName, gfs } = useAppContext();
+      const [furniCat, setFurniCat] = useState("all");
+      const [furniType, setFurniType] = useState("all");
+      const [furniSort, setFurniSort] = useState("user");
+      const [dragId, setDragId] = useState(null);
+
+      const eSeriesIdx = (f) => { const s = eFurnSeries(f) || "その他"; const i = SERIES_ORDER.indexOf(s); return i >= 0 ? i : 0; };
+
+      const filteredFurniture = useMemo(() => {
+        const order = state.furnitureOrder || allFurniture.map(f => f.id);
+        let list = order.filter(id => allFurnMap[id]).map(id => allFurnMap[id]);
+        if (furniCat !== "all") list = list.filter(f => f.cat === furniCat);
+        if (furniType !== "all") list = list.filter(f => f.type === furniType);
+        if (search) { list = list.filter(f => searchMatch(eFurnName(f), search) || eFurnTargets(f).some(sid => searchMatch(eStudentName(allStudentMap[sid] || { name: sid }), search))); }
+        if (furniSort === "name") list = [...list].sort((a, b) => eFurnName(a).localeCompare(eFurnName(b), "ja"));
+        else if (furniSort === "series") list = [...list].sort((a, b) => eSeriesIdx(a) - eSeriesIdx(b) || eFurnName(a).localeCompare(eFurnName(b), "ja"));
+        return list;
+      }, [furniCat, furniType, search, furniSort, state.furnitureOrder, allFurniture, allFurnMap, allStudentMap, eFurnName, eFurnTargets, eStudentName, eFurnSeries]);
+
+      const startEditFurn = (f) => {
+        setEditFurnId(f.id); setEditStudentId(null);
+        setEditDraft({ name: eFurnName(f), series: eFurnSeries(f), targets: eFurnTargets(f).map(sid => eStudentName(allStudentMap[sid] || { name: sid })).join(", ") });
+      };
+      const applyEditFurn = (fid) => {
+        const targetIds = editDraft.targets.split(",").map(s => s.trim()).filter(Boolean).map(tname => allStudents.find(s => eStudentName(s) === tname)?.id).filter(Boolean);
+        dispatch({ type: "APPLY_MASTER_EDIT_FURN", fid, name: editDraft.name.trim(), targets: targetIds, series: editDraft.series.trim() });
+        setEditFurnId(null);
+      };
+
+      const onDS = (fid) => setDragId(fid);
+      const onDO = (e) => { e.preventDefault(); const y = e.clientY, h = window.innerHeight, zone = 80; if (y < zone) window.scrollBy(0, -(zone - y) / 5); else if (y > h - zone) window.scrollBy(0, (y - (h - zone)) / 5); };
+      const onDE = () => setDragId(null);
+      const onDrop = (tid) => { if (!dragId) return; if (dragId === tid) { setDragId(null); return; } dispatch({ type: "REORDER_FURNITURE", fromId: dragId, toId: tid }); setDragId(null); };
+
+      return (
+        <div>
+          <div style={{ display: "flex", gap: 4, marginBottom: 4 }}>
+            {[["all", `全て(${allFurniture.length})`], ["furniture", `家具(${allFurniture.filter(f => f.cat === "furniture").length})`], ["decoration", `装飾(${allFurniture.filter(f => f.cat === "decoration").length})`]].map(([k, l]) =>
+              <button key={k} onClick={() => setFurniCat(k)} style={btn(furniCat === k, k === "furniture" ? C.catFurn : k === "decoration" ? C.catDeco : C.accentDim)}>{l}</button>
+            )}
+          </div>
+          <div style={{ display: "flex", gap: 3, marginBottom: 4, flexWrap: "wrap" }}>
+            <button onClick={() => setFurniType("all")} style={btn(furniType === "all")}>種別:全て</button>
+            {FURN_TYPES.map(t => <button key={t} onClick={() => setFurniType(t)} style={btn(furniType === t)}>{t}</button>)}
+          </div>
+          <div style={{ display: "flex", gap: 3, marginBottom: 6, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ fontSize: 10, color: C.textDim }}>並替:</span>
+            {[["user", "ユーザー設定"], ["name", "名前"], ["series", "セット"]].map(([k, l]) =>
+              <button key={k} onClick={() => setFurniSort(k)} style={btn(furniSort === k)}>{l}</button>
+            )}
+            <span style={{ flex: 1 }} />
+            {!editMode ? <button onClick={enterEdit} style={{ padding: "5px 12px", border: "none", borderRadius: 6, background: C.accentDim, color: "#fff", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>📝 編集</button>
+              : <><button onClick={saveEdit} style={{ padding: "5px 12px", border: "none", borderRadius: 6, background: "#66bb6a", color: "#000", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>💾 保存</button>
+                <button onClick={cancelEdit} style={{ padding: "5px 12px", border: "none", borderRadius: 6, background: C.danger, color: "#fff", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>✕ 取消</button></>}
+          </div>
+          {filteredFurniture.map((f, i) => {
+            const fs = gfs(f.id); const fn = eFurnName(f); const ft = eFurnTargets(f);
+            const tNames = ft.map(sid => eStudentName(allStudentMap[sid] || { name: sid })).join(", ");
+            const series = eFurnSeries(f); const isCustom = f.id.startsWith("cf_");
+            const showSeriesHeader = furniSort === "series" && (i === 0 || eSeriesIdx(filteredFurniture[i - 1]) !== eSeriesIdx(f));
+            const isEditing = editMode && editFurnId === f.id;
+            return (<div key={f.id}>
+              {showSeriesHeader && <div style={{ fontSize: 11, fontWeight: 700, color: C.accent, padding: "6px 0 2px", borderBottom: `1px solid ${C.border}`, marginBottom: 4 }}>{series || "その他"}</div>}
+              <div draggable={furniSort === "user" && !isEditing} onDragStart={() => onDS(f.id)} onDragOver={onDO} onDrop={() => onDrop(f.id)} onDragEnd={onDE}
+                style={{ background: isEditing ? "#2a3050" : dragId === f.id ? "#3a3c6a" : C.card, borderRadius: 8, padding: "7px 10px", marginBottom: 3, border: `1px solid ${isEditing ? "#ff9800" : fs.owned ? C.owned : C.border}`, cursor: furniSort === "user" && !isEditing ? "grab" : "default", opacity: dragId === f.id ? 0.5 : 1 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontSize: 14, cursor: "pointer", userSelect: "none" }} onClick={() => dispatch({ type: "TOGGLE_FURNITURE_OWNED", fid: f.id })}>{fs.owned ? "✅" : "⬜"}</span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    {!isEditing ? <>
+                      <div style={{ fontSize: 12, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{fn}</div>
+                      <div style={{ fontSize: 10, color: C.textDim }}>
+                        <span style={{ background: f.cat === "decoration" ? C.catDeco : C.catFurn, padding: "1px 4px", borderRadius: 3, marginRight: 3, color: "#fff", fontSize: 9 }}>{f.type}</span>
+                        {series && <span style={{ padding: "1px 4px", borderRadius: 3, marginRight: 3, color: C.accent, fontSize: 9, border: `1px solid ${C.accent}33` }}>{series}</span>}
+                        {tNames}
+                      </div>
+                    </> : <FurnEditForm draft={editDraft} onDraftChange={setEditDraft} onApply={() => applyEditFurn(f.id)} onClose={() => setEditFurnId(null)} />}
+                  </div>
+                  {editMode && !isEditing && <span onClick={() => startEditFurn(f)} style={{ cursor: "pointer", fontSize: 11, color: "#ffb74d", padding: "2px 6px", borderRadius: 4, border: "1px solid #ff980055" }}>✏️</span>}
+                  {isCustom && <span onClick={() => dispatch({ type: "DELETE_CUSTOM_FURNITURE", id: f.id })} style={{ cursor: "pointer", fontSize: 12, color: C.danger }}>✕</span>}
+                  {fs.room > 0 && <span style={{ fontSize: 9, padding: "2px 5px", borderRadius: 4, background: roomColor(fs.room), color: "#fff", fontWeight: 700 }}>{roomLabel(fs.room)}</span>}
+                  {furniSort === "user" && !isEditing && <span style={{ fontSize: 14, color: C.textDim, cursor: "grab" }}>⠿</span>}
+                </div>
+              </div>
+            </div>);
+          })}
+        </div>
+      );
+    }
+
+    // ========== Tab 1: ルーム設置 ==========
+    function RoomTab({ search }) {
+      const { state, hlScope, setHlScope, hlThreshold, setHlThreshold, allFurniture, allFurnMap, allStudentMap, eFurnName, eFurnTargets, eFurnSeries, eStudentName, gfs, furnIsAchieved, furnHasOwnedNotAchieved } = useAppContext();
+      const [roomMode, setRoomMode] = useState("room");
+      const [roomHlAchieved, setRoomHlAchieved] = useState(true);
+      const [roomHlNotAchieved, setRoomHlNotAchieved] = useState(true);
+      const [roomFurnFilter, setRoomFurnFilter] = useState("all");
+      const [roomPlacedFilter, setRoomPlacedFilter] = useState("all");
+      const [roomFurniCat, setRoomFurniCat] = useState("all");
+      const [roomFurniType, setRoomFurniType] = useState("all");
+      const [roomFurniSort, setRoomFurniSort] = useState("name");
+
+      const eSeriesIdx = (f) => { const s = eFurnSeries(f) || "その他"; const i = SERIES_ORDER.indexOf(s); return i >= 0 ? i : 0; };
+
+      const roomFilteredFurniture = useMemo(() => {
+        const order = state.furnitureOrder || allFurniture.map(f => f.id);
+        let list = order.filter(id => allFurnMap[id]).map(id => allFurnMap[id]);
+        list = list.filter(f => gfs(f.id).owned);
+        if (roomFurniCat !== "all") list = list.filter(f => f.cat === roomFurniCat);
+        if (roomFurniType !== "all") list = list.filter(f => f.type === roomFurniType);
+        if (search) { list = list.filter(f => searchMatch(eFurnName(f), search) || eFurnTargets(f).some(sid => searchMatch(eStudentName(allStudentMap[sid] || { name: sid }), search))); }
+        if (roomFurnFilter === "achieved") list = list.filter(f => furnIsAchieved(f));
+        else if (roomFurnFilter === "notAchieved") list = list.filter(f => furnHasOwnedNotAchieved(f));
+        if (roomFurniSort === "name") list = [...list].sort((a, b) => eFurnName(a).localeCompare(eFurnName(b), "ja"));
+        else if (roomFurniSort === "series") list = [...list].sort((a, b) => eSeriesIdx(a) - eSeriesIdx(b) || eFurnName(a).localeCompare(eFurnName(b), "ja"));
+        return list;
+      }, [roomFurniCat, roomFurniType, search, roomFurniSort, roomFurnFilter, state.furnitureOrder, allFurniture, allFurnMap, allStudentMap, state.furniture, state.students, hlScope, hlThreshold, eFurnName, eFurnTargets, eStudentName, gfs, furnIsAchieved, furnHasOwnedNotAchieved]);
+
+      return (
+        <div>
+          <div style={{ display: "flex", gap: 4, marginBottom: 6 }}>
+            <button onClick={() => setRoomMode("room")} style={btn(roomMode === "room")}>ルーム表示</button>
+            <button onClick={() => setRoomMode("furniture")} style={btn(roomMode === "furniture")}>家具表示</button>
+          </div>
+          <div style={{ background: C.card, borderRadius: 6, padding: "6px 10px", marginBottom: 6, display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ fontSize: 10, color: C.gold, fontWeight: 600 }}>🏅HL条件:</span>
+            <span style={{ fontSize: 10, color: C.textDim }}>所持生徒</span>
+            {[["all", "全員が"], ["any", "誰かが"]].map(([k, l]) => <button key={k} onClick={() => setHlScope(k)} style={btn(hlScope === k, C.gold)}>{l}</button>)}
+            <span style={{ fontSize: 10, color: C.textDim }}>絆</span>
+            {[["cap", "上限"], ["ex920", "EX有20/EX無9"]].map(([k, l]) => <button key={k} onClick={() => setHlThreshold(k)} style={btn(hlThreshold === k, C.gold)}>{l}</button>)}
+            <span style={{ fontSize: 10, color: C.textDim }}>に達成</span>
+            <span style={{ fontSize: 10, color: C.textDim, marginLeft: 6 }}>HL表示:</span>
+            <button onClick={() => setRoomHlAchieved(!roomHlAchieved)} style={btn(roomHlAchieved, C.gold)}>達成{roomHlAchieved ? "✓" : "✗"}</button>
+            <button onClick={() => setRoomHlNotAchieved(!roomHlNotAchieved)} style={btn(roomHlNotAchieved, C.hlNA)}>未達成{roomHlNotAchieved ? "✓" : "✗"}</button>
+          </div>
+          <div style={{ background: C.card, borderRadius: 6, padding: "6px 10px", marginBottom: 6 }}>
+            <div style={{ display: "flex", gap: 3, marginBottom: 4, flexWrap: "wrap" }}>
+              {[["all", "全て"], ["furniture", "家具"], ["decoration", "装飾"]].map(([k, l]) =>
+                <button key={k} onClick={() => setRoomFurniCat(k)} style={btn(roomFurniCat === k, k === "furniture" ? C.catFurn : k === "decoration" ? C.catDeco : C.accentDim)}>{l}</button>
+              )}
+            </div>
+            <div style={{ display: "flex", gap: 3, marginBottom: 4, flexWrap: "wrap" }}>
+              <button onClick={() => setRoomFurniType("all")} style={btn(roomFurniType === "all")}>種別:全て</button>
+              {FURN_TYPES.map(t => <button key={t} onClick={() => setRoomFurniType(t)} style={btn(roomFurniType === t)}>{t}</button>)}
+            </div>
+            <div style={{ display: "flex", gap: 3, flexWrap: "wrap", alignItems: "center" }}>
+              <span style={{ fontSize: 10, color: C.textDim }}>並替:</span>
+              {[["user", "順序"], ["name", "名前"], ["series", "セット"]].map(([k, l]) => <button key={k} onClick={() => setRoomFurniSort(k)} style={btn(roomFurniSort === k)}>{l}</button>)}
+              <span style={{ fontSize: 10, color: C.textDim, marginLeft: 6 }}>達成:</span>
+              {[["all", "全て"], ["achieved", "達成済"], ["notAchieved", "未達成"]].map(([k, l]) => <button key={k} onClick={() => setRoomFurnFilter(k)} style={btn(roomFurnFilter === k, k === "achieved" ? C.gold : k === "notAchieved" ? C.hlNA : undefined)}>{l}</button>)}
+              {roomMode === "room" && <>
+                <span style={{ fontSize: 10, color: C.textDim, marginLeft: 6 }}>設置:</span>
+                {[["all", "全て"], ["placed", "設置中"], ["notPlaced", "未設置"]].map(([k, l]) => <button key={k} onClick={() => setRoomPlacedFilter(k)} style={btn(roomPlacedFilter === k)}>{l}</button>)}
+              </>}
+            </div>
+          </div>
+          <div style={{ fontSize: 10, color: C.textDim, marginBottom: 6, padding: "3px 8px", background: C.card, borderRadius: 6, lineHeight: 1.6 }}>
+            <span style={{ color: C.gold }}>■</span>達成HL&nbsp;&nbsp;<span style={{ color: C.hlNA }}>■</span>未達成HL(所持生徒あり)&nbsp;&nbsp;<span style={{ color: C.gold }}>生徒名</span>条件達成&nbsp;&nbsp;<span style={{ color: C.hlNA }}>生徒名</span>所持・未達成
+          </div>
+          {roomMode === "room" ? <div>
+            {[1, 2].map(rn => {
+              const displayList = roomPlacedFilter === "placed" ? roomFilteredFurniture.filter(f => isInRoom(gfs(f.id).room, rn)) : roomPlacedFilter === "notPlaced" ? roomFilteredFurniture.filter(f => !isInRoom(gfs(f.id).room, rn)) : roomFilteredFurniture;
+              const inRoomCount = roomFilteredFurniture.filter(f => isInRoom(gfs(f.id).room, rn)).length;
+              return <div key={rn} style={{ marginBottom: 20 }}>
+                <h3 style={{ fontSize: 15, color: rn === 1 ? C.room1 : C.room2, marginBottom: 4 }}>ルーム {rn} <span style={{ fontSize: 11, fontWeight: 400, color: C.textDim }}>({inRoomCount}個チェック済 / {displayList.length}個表示中)</span></h3>
+                {displayList.length === 0 && <div style={{ fontSize: 12, color: C.textDim, padding: 8 }}>表示する家具なし</div>}
+                {displayList.map(f => <FurnRoomCard key={f.id} f={f} border={roomColor(rn)} showCheckbox={true} roomNum={rn} roomHlAchieved={roomHlAchieved} roomHlNotAchieved={roomHlNotAchieved} />)}
+              </div>;
+            })}
+          </div> : <div>
+            {[1, 2].map(rn => {
+              const rf = roomFilteredFurniture.filter(f => isInRoom(gfs(f.id).room, rn));
+              return <div key={rn} style={{ marginBottom: 16 }}>
+                <h3 style={{ fontSize: 14, color: rn === 1 ? C.room1 : C.room2, marginBottom: 6 }}>ルーム {rn} ({rf.length}個)</h3>
+                {rf.length === 0 && <div style={{ fontSize: 12, color: C.textDim, padding: 8 }}>設置なし</div>}
+                {rf.map(f => <FurnRoomCard key={f.id} f={f} border={roomColor(rn)} showSelect={true} roomHlAchieved={roomHlAchieved} roomHlNotAchieved={roomHlNotAchieved} />)}
+              </div>;
+            })}
+            <h3 style={{ fontSize: 14, color: C.textDim, marginBottom: 6 }}>未設置(所持済み)</h3>
+            {roomFilteredFurniture.filter(f => gfs(f.id).room === 0).map(f => <FurnRoomCard key={f.id} f={f} border={C.border} showSelect={true} roomHlAchieved={roomHlAchieved} roomHlNotAchieved={roomHlNotAchieved} />)}
+          </div>}
+        </div>
+      );
+    }
+
+    // ========== Tab 2: 絆ランク ==========
+    function BondTab({ search }) {
+      const { state, dispatch, editMode, enterEdit, saveEdit, cancelEdit, editFurnId, setEditFurnId, editStudentId, setEditStudentId, editDraft, setEditDraft, allStudents, allFurniture, allFurnMap, eFurnName, eFurnTargets, eFurnSeries, eStudentName, gss, motionStudentIds, bondCheck } = useAppContext();
+      const [studentSort, setStudentSort] = useState("name-asc");
+      const [bondFilter, setBondFilter] = useState("all");
+      const [motionFilter, setMotionFilter] = useState("all");
+      const [bondHlEnabled, setBondHlEnabled] = useState(true);
+
+      const sortedStudents = useMemo(() => {
+        let list = [...allStudents];
+        if (search) { list = list.filter(s => searchMatch(eStudentName(s), search)); }
+        if (bondFilter === "owned") list = list.filter(s => gss(s.id).owned);
+        else if (bondFilter === "notOwned") list = list.filter(s => !gss(s.id).owned);
+        if (motionFilter === "hasMotion") list = list.filter(s => motionStudentIds.has(s.id));
+        else if (motionFilter === "noMotion") list = list.filter(s => !motionStudentIds.has(s.id));
+        const [key, dir] = studentSort.split("-");
+        list.sort((a, b) => {
+          if (key === "name") { const c = eStudentName(a).localeCompare(eStudentName(b), "ja"); return dir === "asc" ? c : -c; }
+          if (key === "bond") { const ba = gss(a.id).bond, bb = gss(b.id).bond; if (ba !== bb) return dir === "asc" ? ba - bb : bb - ba; return eStudentName(a).localeCompare(eStudentName(b), "ja"); }
+          const sa = gss(a.id).star, sb = gss(b.id).star; if (sa !== sb) return dir === "asc" ? sa - sb : sb - sa; return eStudentName(a).localeCompare(eStudentName(b), "ja");
+        });
+        return list;
+      }, [search, studentSort, bondFilter, motionFilter, state.students, allStudents, motionStudentIds, eStudentName, gss]);
+
+      const sortOpts = [{ v: "name-asc", l: "名前↑" }, { v: "name-desc", l: "名前↓" }, { v: "star-asc", l: "★↑" }, { v: "star-desc", l: "★↓" }, { v: "bond-asc", l: "絆↑" }, { v: "bond-desc", l: "絆↓" }];
+
+      const startEditFurn = (f) => {
+        setEditFurnId(f.id); setEditStudentId(null);
+        setEditDraft({ name: eFurnName(f), series: eFurnSeries(f), targets: eFurnTargets(f).map(sid => eStudentName(allStudents.find(s => s.id === sid) || { name: sid })).join(", ") });
+      };
+      const applyEditFurn = (fid) => {
+        const targetIds = editDraft.targets.split(",").map(s => s.trim()).filter(Boolean).map(tname => allStudents.find(s => eStudentName(s) === tname)?.id).filter(Boolean);
+        dispatch({ type: "APPLY_MASTER_EDIT_FURN", fid, name: editDraft.name.trim(), targets: targetIds, series: editDraft.series.trim() });
+        setEditFurnId(null);
+      };
+      const startEditStudent = (s) => { setEditStudentId(s.id); setEditFurnId(null); setEditDraft({ name: eStudentName(s) }); };
+      const applyEditStudent = (sid) => { dispatch({ type: "APPLY_MASTER_EDIT_STUDENT", sid, name: editDraft.name.trim() }); setEditStudentId(null); };
+
+      return (
+        <div>
+          <div style={{ display: "flex", gap: 3, marginBottom: 4, flexWrap: "wrap", alignItems: "center" }}>
+            {sortOpts.map(o => <button key={o.v} onClick={() => setStudentSort(o.v)} style={btn(studentSort === o.v)}>{o.l}</button>)}
+            <span style={{ fontSize: 10, color: C.textDim, marginLeft: 6 }}>HL:</span>
+            <button onClick={() => setBondHlEnabled(!bondHlEnabled)} style={btn(bondHlEnabled, C.gold)}>{bondHlEnabled ? "ON" : "OFF"}</button>
+            <span style={{ flex: 1 }} />
+            {!editMode ? <button onClick={enterEdit} style={{ padding: "5px 12px", border: "none", borderRadius: 6, background: C.accentDim, color: "#fff", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>📝 編集</button>
+              : <><button onClick={saveEdit} style={{ padding: "5px 12px", border: "none", borderRadius: 6, background: "#66bb6a", color: "#000", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>💾 保存</button>
+                <button onClick={cancelEdit} style={{ padding: "5px 12px", border: "none", borderRadius: 6, background: C.danger, color: "#fff", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>✕ 取消</button></>}
+          </div>
+          <div style={{ display: "flex", gap: 3, marginBottom: 4, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 10, color: C.textDim, lineHeight: "26px" }}>絞込:</span>
+            {[["all", "全て"], ["owned", "所持"], ["notOwned", "未所持"]].map(([k, l]) => <button key={k} onClick={() => setBondFilter(k)} style={btn(bondFilter === k)}>{l}</button>)}
+            <span style={{ fontSize: 10, color: C.textDim, lineHeight: "26px", marginLeft: 6 }}>家具:</span>
+            {[["all", "全て"], ["hasMotion", "有"], ["noMotion", "無"]].map(([k, l]) => <button key={k} onClick={() => setMotionFilter(k)} style={btn(motionFilter === k)}>{l}</button>)}
+          </div>
+          <div style={{ fontSize: 10, color: C.textDim, marginBottom: 6, padding: "3px 8px", background: C.card, borderRadius: 6, lineHeight: 1.6 }}>
+            <span style={{ color: C.amber }}>■</span>EX無&絆≥9 <span style={{ color: C.purple }}>■</span>EX有&絆≥20 <span style={{ color: C.gold }}>■</span>絆MAX ▸EXタップ切替
+          </div>
+          {sortedStudents.map(s => {
+            const ss = gss(s.id); const cap = getBondCap(ss.star); const isMax = ss.bond >= cap;
+            const hasEx = ss.hasEx; const relFurn = allFurniture.filter(f => eFurnTargets(f).includes(s.id));
+            const hlA = !hasEx && ss.bond >= 9 && !isMax; const hlP = hasEx && ss.bond >= 20 && !isMax;
+            const rawHlBg = isMax ? `${C.gold}18` : hlP ? `${C.purple}33` : hlA ? `${C.amber}28` : C.card;
+            const rawHlB = isMax ? C.gold : hlP ? C.purple : hlA ? C.amber : C.border;
+            const hlBg = bondHlEnabled ? rawHlBg : C.card;
+            const hlB = bondHlEnabled ? rawHlB : C.border;
+            const boxShadow = bondHlEnabled ? (isMax ? `0 0 6px ${C.gold}33` : hlP || hlA ? `0 0 6px ${rawHlB}33` : "none") : "none";
+            const isCustom = s.id.startsWith("cs_");
+            const sn = eStudentName(s);
+            const isEditingS = editMode && editStudentId === s.id;
+            const editingRelFurnId = editMode && editFurnId && relFurn.some(f => f.id === editFurnId) ? editFurnId : null;
+            return <div key={s.id} style={{ background: isEditingS ? "#2a3050" : hlBg, borderRadius: 8, padding: "7px 10px", marginBottom: 3, border: `1px solid ${isEditingS ? "#ff9800" : hlB}`, boxShadow }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ fontSize: 14, cursor: "pointer" }} onClick={() => dispatch({ type: "TOGGLE_STUDENT_OWNED", sid: s.id })}>{ss.owned ? "✅" : "⬜"}</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  {!isEditingS ? <div style={{ fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", flexWrap: "wrap", gap: 3 }}>
+                    {sn} <span style={{ fontSize: 10, color: C.gold }}>{"★".repeat(ss.star)}</span>
+                    <span onClick={() => dispatch({ type: "TOGGLE_STUDENT_EX", sid: s.id })} style={{ fontSize: 9, padding: "1px 4px", borderRadius: 4, fontWeight: 700, cursor: "pointer", userSelect: "none", background: hasEx ? "#ce93d8" : "#555", color: hasEx ? "#1a1a2e" : "#999", border: hasEx ? "1px solid #ce93d8" : "1px dashed #777" }}>{hasEx ? "EX有" : "EX無"}</span>
+                    {bondHlEnabled && hlA && <span style={{ fontSize: 9, color: C.amber }}>⚠絆{ss.bond}</span>}
+                    {bondHlEnabled && hlP && <span style={{ fontSize: 9, color: C.purple }}>💎絆{ss.bond}</span>}
+                    {isCustom && <span onClick={() => dispatch({ type: "DELETE_CUSTOM_STUDENT", id: s.id })} style={{ cursor: "pointer", fontSize: 11, color: C.danger, marginLeft: 4 }}>✕削除</span>}
+                    {editMode && <span onClick={() => startEditStudent(s)} style={{ cursor: "pointer", fontSize: 11, color: "#ffb74d", marginLeft: 2, padding: "1px 5px", borderRadius: 4, border: "1px solid #ff980055" }}>✏️</span>}
+                  </div> : <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
+                    <input value={editDraft.name || ""} onChange={e => setEditDraft({ ...editDraft, name: e.target.value })} style={{ flex: 1, minWidth: 100, padding: "3px 6px", borderRadius: 4, border: `1px solid ${C.border}`, background: C.bg, color: C.text, fontSize: 11, outline: "none" }} />
+                    <button onClick={() => applyEditStudent(s.id)} style={{ padding: "3px 8px", border: "none", borderRadius: 4, background: "#66bb6a", color: "#000", fontSize: 10, fontWeight: 700, cursor: "pointer" }}>適用</button>
+                    <button onClick={() => setEditStudentId(null)} style={{ padding: "3px 8px", border: "none", borderRadius: 4, background: C.card, color: C.textDim, fontSize: 10, cursor: "pointer" }}>閉じる</button>
+                  </div>}
+                  <div style={{ fontSize: 10, color: C.textDim, marginTop: 1 }}>
+                    {relFurn.map((f, i) => (
+                      <span key={f.id}>{i > 0 && ", "}
+                        {editMode ? <span onClick={() => editFurnId === f.id ? setEditFurnId(null) : startEditFurn(f)} style={{ cursor: "pointer", color: editFurnId === f.id ? "#ffb74d" : C.accent, textDecoration: "underline" }}>{eFurnName(f)}</span>
+                          : <span>{eFurnName(f)}</span>}
+                      </span>
+                    ))}
+                  </div>
+                  {editingRelFurnId && (() => {
+                    const ef = allFurnMap[editingRelFurnId];
+                    if (!ef) return null;
+                    return <div style={{ background: "#1e2040", borderRadius: 6, padding: 8, marginTop: 5, border: "1px solid #ff9800" }}>
+                      <FurnEditForm title={`家具編集: ${eFurnName(ef)}`} draft={editDraft} onDraftChange={setEditDraft} onApply={() => applyEditFurn(editingRelFurnId)} onClose={() => setEditFurnId(null)} />
+                    </div>;
+                  })()}
+                </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 5, marginTop: 5 }}>
+                <div style={{ display: "flex", gap: 1 }}>{[1, 2, 3, 4, 5].map(n => <span key={n} onClick={() => dispatch({ type: "SET_STUDENT_STAR", sid: s.id, star: n })} style={{ cursor: "pointer", fontSize: 13, color: n <= ss.star ? C.gold : C.textDim, userSelect: "none" }}>★</span>)}</div>
+                <span style={{ fontSize: 10, color: C.textDim }}>絆</span>
+                <input type="range" min={1} max={cap} value={ss.bond} onChange={e => dispatch({ type: "SET_STUDENT_BOND", sid: s.id, bond: Number(e.target.value) })} style={{ flex: 1, accentColor: isMax ? C.gold : C.accent }} />
+                <input type="number" min={1} max={cap} value={ss.bond} onChange={e => { const v = parseInt(e.target.value); if (!isNaN(v)) dispatch({ type: "SET_STUDENT_BOND", sid: s.id, bond: v }); }} style={{ width: 40, background: C.card, color: isMax ? C.gold : C.text, border: `1px solid ${C.border}`, borderRadius: 4, padding: "2px 4px", fontSize: 11, textAlign: "right", outline: "none" }} />
+                <span style={{ fontSize: 10, color: C.textDim }}>/{cap}</span>
+              </div>
+            </div>;
+          })}
+        </div>
+      );
+    }
+
+    // ========== Tab 3: データ管理 ==========
+    function DataTab() {
+      const { state, dispatch, allStudents, allFurniture, eStudentName } = useAppContext();
+      const [showIO, setShowIO] = useState(false);
+      const [importText, setImportText] = useState("");
+      const [confirmReset, setConfirmReset] = useState(false);
+      const [addMode, setAddMode] = useState(null);
+      const [addForm, setAddForm] = useState({});
+      const fileInputRef = useRef(null);
+
+      const addCustomStudent = () => {
+        const name = addForm.name?.trim(); if (!name) return;
+        const id = "cs_" + Date.now();
+        dispatch({ type: "ADD_CUSTOM_STUDENT", student: { id, name, star: Number(addForm.star) || 3, hasEx: !!addForm.hasEx }, initialState: { owned: false, star: Number(addForm.star) || 3, bond: 1, hasEx: !!addForm.hasEx } });
+        setAddForm({}); setAddMode(null);
+      };
+      const addCustomFurniture = () => {
+        const name = addForm.name?.trim(); if (!name) return;
+        const id = "cf_" + Date.now();
+        const targetIds = (addForm.targets || "").split(",").map(s => s.trim()).filter(Boolean).map(tname => allStudents.find(s => eStudentName(s) === tname)?.id).filter(Boolean);
+        dispatch({ type: "ADD_CUSTOM_FURNITURE", furniture: { id, name, type: addForm.type || "小物", cat: addForm.cat || "furniture", targets: targetIds }, initialState: { owned: false, room: 0 } });
+        setAddForm({}); setAddMode(null);
+      };
+      const exportJson = useMemo(() => showIO ? JSON.stringify(state, null, 2) : "", [showIO, state]);
+      const doImport = () => {
+        try { const d = JSON.parse(importText); if (d.students && d.furniture) { dispatch({ type: "IMPORT_STATE", data: d }); setImportText(""); setShowIO(false); } else { alert("無効なデータ"); } } catch { alert("JSON形式エラー"); }
+      };
+      const doExportFile = () => {
+        const blob = new Blob([exportJson], { type: "application/json" }); const url = URL.createObjectURL(blob);
+        const a = document.createElement("a"); a.href = url; a.download = "ba-furniture-data.json"; a.click(); URL.revokeObjectURL(url);
+      };
+      const doImportFile = (e) => {
+        const file = e.target.files[0]; if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => { try { const d = JSON.parse(ev.target.result); if (d.students && d.furniture) { dispatch({ type: "IMPORT_STATE", data: d }); setImportText(""); setShowIO(false); } else { alert("無効なデータ"); } } catch { alert("JSON形式エラー"); } };
+        reader.readAsText(file); e.target.value = "";
+      };
+      const doReset = () => { dispatch({ type: "RESET_STATE" }); setConfirmReset(false); };
+
+      return (
+        <div style={{ padding: 8 }}>
+          <div style={{ background: C.card, borderRadius: 8, padding: 12, marginBottom: 10 }}>
+            <h3 style={{ fontSize: 14, marginBottom: 6 }}>マスタデータ</h3>
+            <div style={{ fontSize: 11, color: C.textDim, lineHeight: 1.8 }}>
+              <div>生徒: {allStudents.length}名 (★3:{allStudents.filter(s => s.star === 3).length} ★2:{allStudents.filter(s => s.star === 2).length} ★1:{allStudents.filter(s => s.star === 1).length}) EX有:{allStudents.filter(s => s.hasEx).length}名</div>
+              <div>家具: {allFurniture.length}個 (家具:{allFurniture.filter(f => f.cat === "furniture").length} 装飾:{allFurniture.filter(f => f.cat === "decoration").length})</div>
+              <div>カスタム: 生徒{(state.customStudents || []).length}名 家具{(state.customFurniture || []).length}個</div>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
+            <button onClick={() => { setAddMode(addMode === "student" ? null : "student"); setAddForm({ star: 3 }); }} style={{ padding: "7px 14px", border: "none", borderRadius: 6, background: addMode === "student" ? "#66bb6a" : C.accentDim, color: "#fff", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>+ 生徒追加</button>
+            <button onClick={() => { setAddMode(addMode === "furniture" ? null : "furniture"); setAddForm({ cat: "furniture", type: "小物" }); }} style={{ padding: "7px 14px", border: "none", borderRadius: 6, background: addMode === "furniture" ? "#66bb6a" : C.accentDim, color: "#fff", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>+ 家具追加</button>
+          </div>
+          {addMode === "student" && <div style={{ background: C.card, borderRadius: 8, padding: 12, marginBottom: 10 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>生徒追加</div>
+            <input placeholder="名前" value={addForm.name || ""} onChange={e => setAddForm({ ...addForm, name: e.target.value })} style={{ width: "100%", boxSizing: "border-box", padding: "6px 8px", borderRadius: 4, border: `1px solid ${C.border}`, background: C.bg, color: C.text, fontSize: 12, marginBottom: 4, outline: "none" }} />
+            <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6 }}>
+              <span style={{ fontSize: 11, color: C.textDim }}>★</span>
+              <select value={addForm.star || 3} onChange={e => setAddForm({ ...addForm, star: Number(e.target.value) })} style={{ background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 4, padding: "4px 6px", fontSize: 11 }}>
+                {[1, 2, 3].map(n => <option key={n} value={n}>★{n}</option>)}
+              </select>
+              <label style={{ fontSize: 11, color: C.textDim, cursor: "pointer" }}><input type="checkbox" checked={!!addForm.hasEx} onChange={e => setAddForm({ ...addForm, hasEx: e.target.checked })} /> EX有</label>
+            </div>
+            <button onClick={addCustomStudent} style={{ padding: "6px 16px", border: "none", borderRadius: 6, background: "#66bb6a", color: "#000", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>追加</button>
+          </div>}
+          {addMode === "furniture" && <div style={{ background: C.card, borderRadius: 8, padding: 12, marginBottom: 10 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>家具追加</div>
+            <input placeholder="名前" value={addForm.name || ""} onChange={e => setAddForm({ ...addForm, name: e.target.value })} style={{ width: "100%", boxSizing: "border-box", padding: "6px 8px", borderRadius: 4, border: `1px solid ${C.border}`, background: C.bg, color: C.text, fontSize: 12, marginBottom: 4, outline: "none" }} />
+            <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 4, flexWrap: "wrap" }}>
+              <select value={addForm.cat || "furniture"} onChange={e => setAddForm({ ...addForm, cat: e.target.value })} style={{ background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 4, padding: "4px", fontSize: 11 }}>
+                <option value="furniture">家具</option><option value="decoration">装飾</option>
+              </select>
+              <select value={addForm.type || "小物"} onChange={e => setAddForm({ ...addForm, type: e.target.value })} style={{ background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 4, padding: "4px", fontSize: 11 }}>
+                {FURN_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </div>
+            <input placeholder="対象生徒名(カンマ区切り)" value={addForm.targets || ""} onChange={e => setAddForm({ ...addForm, targets: e.target.value })} style={{ width: "100%", boxSizing: "border-box", padding: "6px 8px", borderRadius: 4, border: `1px solid ${C.border}`, background: C.bg, color: C.text, fontSize: 11, marginBottom: 6, outline: "none" }} />
+            <button onClick={addCustomFurniture} style={{ padding: "6px 16px", border: "none", borderRadius: 6, background: "#66bb6a", color: "#000", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>追加</button>
+          </div>}
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
+            <button onClick={() => { setShowIO(!showIO); setImportText(""); }} style={{ padding: "7px 14px", border: "none", borderRadius: 6, background: C.accent, color: "#000", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>{showIO ? "閉じる" : "エクスポート/インポート"}</button>
+            {!confirmReset ? <button onClick={() => setConfirmReset(true)} style={{ padding: "7px 14px", border: "none", borderRadius: 6, background: C.danger, color: "#fff", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>全データリセット</button>
+              : <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                <span style={{ fontSize: 11, color: C.danger, fontWeight: 700 }}>本当に？</span>
+                <button onClick={doReset} style={{ padding: "5px 12px", border: "none", borderRadius: 6, background: C.danger, color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>実行</button>
+                <button onClick={() => setConfirmReset(false)} style={{ padding: "5px 12px", border: "none", borderRadius: 6, background: C.card, color: C.textDim, fontSize: 11, cursor: "pointer" }}>取消</button>
+              </div>}
+          </div>
+          {showIO && <div style={{ background: C.card, borderRadius: 8, padding: 12 }}>
+            <input ref={fileInputRef} type="file" accept=".json" style={{ display: "none" }} onChange={doImportFile} />
+            <div style={{ fontSize: 12, color: C.accent, fontWeight: 600, marginBottom: 4 }}>エクスポート</div>
+            <textarea readOnly value={exportJson} onFocus={e => e.target.select()} style={{ background: "#1e1e38", border: `1px solid ${C.border}`, borderRadius: 6, color: "#81c784", padding: 6, fontFamily: "monospace", fontSize: 10, outline: "none", width: "100%", minHeight: 50, resize: "vertical", boxSizing: "border-box", marginBottom: 6 }} />
+            <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+              <button onClick={doExportFile} style={{ padding: "7px 14px", border: "none", borderRadius: 6, background: C.accent, color: "#000", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>ファイルとして保存</button>
+            </div>
+            <div style={{ fontSize: 12, color: C.amber, fontWeight: 600, marginBottom: 4 }}>インポート</div>
+            <textarea value={importText} onChange={e => setImportText(e.target.value)} placeholder="JSON貼り付け..." style={{ background: "#1e1e38", border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, padding: 6, fontFamily: "monospace", fontSize: 10, outline: "none", width: "100%", minHeight: 50, resize: "vertical", boxSizing: "border-box", marginBottom: 6 }} />
+            <div style={{ display: "flex", gap: 6 }}>
+              <button onClick={doImport} style={{ padding: "7px 14px", border: "none", borderRadius: 6, background: "#66bb6a", color: "#000", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>テキストからインポート</button>
+              <button onClick={() => fileInputRef.current?.click()} style={{ padding: "7px 14px", border: "none", borderRadius: 6, background: C.accentDim, color: "#fff", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>ファイルから読み込み</button>
+            </div>
+          </div>}
+        </div>
+      );
+    }
+
+    // ========== メインアプリ ==========
+    function AppInner() {
+      const { loaded, editMode, saveEdit, cancelEdit, allStudents, stats } = useAppContext();
+      const [tab, setTab] = useState(0);
+      const [search, setSearch] = useState("");
+      const [roomSearch, setRoomSearch] = useState("");
+      const tabs = ["所持状況", "ルーム設置", "絆ランク", "データ管理"];
+
+      if (!loaded) return <div style={{ background: C.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", color: C.textDim }}>読み込み中...</div>;
+
+      return (
+        <div style={{ background: C.bg, minHeight: "100vh", color: C.text, fontFamily: "'Segoe UI',sans-serif", maxWidth: 900, margin: "0 auto", padding: "8px 12px" }}>
+          <h2 style={{ textAlign: "center", margin: "8px 0", fontSize: 18, background: "linear-gradient(135deg,#4fc3f7,#7c4dff)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>ブルアカ モーション家具マネージャー</h2>
+          <div style={{ textAlign: "center", fontSize: 11, color: C.textDim, marginBottom: 8 }}>家具 {stats.of}/{stats.tf} | R1:{stats.r1} R2:{stats.r2} | 生徒 {allStudents.length}名</div>
+          <div style={{ display: "flex", gap: 4, marginBottom: 8 }}>
+            {tabs.map((t, i) => (
+              <button key={i} onClick={() => {
+                if (editMode) { if (!confirm("編集中です。変更を破棄してタブを切り替えますか？")) return; cancelEdit(); }
+                setTab(i);
+              }} style={{ flex: 1, padding: "8px 0", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 13, fontWeight: 600, background: tab === i ? C.accent : C.card, color: tab === i ? "#000" : C.textDim }}>{t}</button>
+            ))}
+          </div>
+          {editMode && <div style={{ background: "#ff980033", border: "1px solid #ff9800", borderRadius: 6, padding: "6px 12px", marginBottom: 8, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <span style={{ fontSize: 12, fontWeight: 600, color: "#ffb74d" }}>📝 編集モード</span>
+            <div style={{ display: "flex", gap: 4 }}>
+              <button onClick={saveEdit} style={{ padding: "4px 10px", border: "none", borderRadius: 4, background: "#66bb6a", color: "#000", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>💾 保存</button>
+              <button onClick={cancelEdit} style={{ padding: "4px 10px", border: "none", borderRadius: 4, background: C.danger, color: "#fff", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>✕ 取消</button>
+            </div>
+          </div>}
+          {tab < 3 && <input value={tab === 1 ? roomSearch : search} onChange={e => tab === 1 ? setRoomSearch(e.target.value) : setSearch(e.target.value)} placeholder="検索(家具名・生徒名)..." style={{ width: "100%", padding: "8px 12px", boxSizing: "border-box", borderRadius: 6, border: `1px solid ${C.border}`, background: C.card, color: C.text, fontSize: 13, marginBottom: 8, outline: "none" }} />}
+          {tab === 0 && <PossessionTab search={search} />}
+          {tab === 1 && <RoomTab search={roomSearch} />}
+          {tab === 2 && <BondTab search={search} />}
+          {tab === 3 && <DataTab />}
+        </div>
+      );
+    }
+
+    function App() {
+      return <AppProvider><AppInner /></AppProvider>;
+    }
+
     const root = ReactDOM.createRoot(document.getElementById("root"));
     root.render(<App />);
   </script>
